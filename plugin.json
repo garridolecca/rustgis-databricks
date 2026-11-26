@@ -1,0 +1,145 @@
+{
+  "id": "databricks-sql",
+  "name": "Databricks SQL",
+  "version": "0.1.0",
+  "description": "Load Unity Catalog spatial tables and SQL from a Databricks SQL warehouse as RustGIS layers. GEOMETRY and GEOGRAPHY columns, Databricks CLI / SDK sign-in, current-view filtering.",
+  "author": "Jhonatan Garrido-Lecca",
+  "homepage": "https://github.com/garridolecca/rustgis-databricks",
+  "license": "Apache-2.0",
+  "abi": 1,
+  "minRustgisVersion": "0.8.0",
+  "runtime": "process",
+  "python": {
+    "version": "3.12",
+    "requirements": "requirements.txt"
+  },
+  "run": [
+    "python",
+    "main.py"
+  ],
+  "permissions": [
+    "edit",
+    "network"
+  ],
+  "commands": [
+    {
+      "id": "connect",
+      "label": "Connect",
+      "icon": "database",
+      "help": "Pick a Databricks CLI profile and SQL warehouse. Sign-in uses the profile, like the Databricks CLI.",
+      "params": "{\"profile\": \"CLI profile in ~/.databrickscfg\", \"warehouse_id\": \"SQL warehouse id\"}",
+      "form": [
+        {
+          "name": "profile",
+          "label": "Databricks CLI profile",
+          "kind": "text",
+          "default": "DEFAULT",
+          "required": true
+        },
+        {
+          "name": "warehouse_id",
+          "label": "SQL warehouse ID",
+          "kind": "text",
+          "default": "",
+          "required": true
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "id": "browse",
+      "label": "Browse\nSpatial Tables",
+      "icon": "search",
+      "help": "List tables with a GEOMETRY or GEOGRAPHY column in a catalog (and optional schema).",
+      "params": "{\"catalog\": \"catalog\", \"schema\": \"optional schema\"}",
+      "form": [
+        {
+          "name": "catalog",
+          "label": "Catalog",
+          "kind": "text",
+          "default": "",
+          "required": true
+        },
+        {
+          "name": "schema",
+          "label": "Schema (optional)",
+          "kind": "text",
+          "default": ""
+        }
+      ],
+      "timeout": 120
+    },
+    {
+      "id": "add-table",
+      "label": "Add\nTable",
+      "icon": "add_layer",
+      "help": "Add a Unity Catalog table as a layer. Tick 'Only the current view' for big tables.",
+      "params": "{\"table\": \"catalog.schema.table\", \"geometry\": \"optional column\", \"limit\": 50000, \"in_view\": false}",
+      "form": [
+        {
+          "name": "table",
+          "label": "Table (catalog.schema.table)",
+          "kind": "text",
+          "default": "",
+          "required": true
+        },
+        {
+          "name": "geometry",
+          "label": "Geometry column (optional)",
+          "kind": "text",
+          "default": ""
+        },
+        {
+          "name": "limit",
+          "label": "Row limit",
+          "kind": "number",
+          "integer": true,
+          "default": 50000
+        },
+        {
+          "name": "in_view",
+          "label": "Only the current view",
+          "kind": "bool",
+          "default": false
+        }
+      ],
+      "timeout": 300
+    },
+    {
+      "id": "sql-layer",
+      "label": "SQL\nLayer",
+      "icon": "sql",
+      "help": "Run a SELECT on the warehouse and add the result as a layer. The first GEOMETRY / GEOGRAPHY column is the geometry.",
+      "params": "{\"sql\": \"SELECT ...\", \"name\": \"layer name\", \"geometry\": \"optional column\", \"limit\": 50000}",
+      "form": [
+        {
+          "name": "sql",
+          "label": "SELECT statement",
+          "kind": "text",
+          "default": "",
+          "required": true
+        },
+        {
+          "name": "name",
+          "label": "Layer name",
+          "kind": "text",
+          "default": "Databricks SQL"
+        },
+        {
+          "name": "geometry",
+          "label": "Geometry column (optional)",
+          "kind": "text",
+          "default": ""
+        },
+        {
+          "name": "limit",
+          "label": "Row limit",
+          "kind": "number",
+          "integer": true,
+          "default": 50000
+        }
+      ],
+      "timeout": 300
+    }
+  ]
+}
