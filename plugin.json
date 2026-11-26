@@ -1,8 +1,8 @@
 {
   "id": "databricks-sql",
   "name": "Databricks SQL",
-  "version": "0.1.0",
-  "description": "Load Unity Catalog spatial tables and SQL from a Databricks SQL warehouse as RustGIS layers. GEOMETRY and GEOGRAPHY columns, Databricks CLI / SDK sign-in, current-view filtering.",
+  "version": "0.2.0",
+  "description": "A Databricks panel for RustGIS: sign in with a Databricks CLI profile, browse Unity Catalog for GEOMETRY / GEOGRAPHY tables, and add them, or any SQL, as layers. Filter to the current view or a box you draw, so big tables stay on the warehouse.",
   "author": "Jhonatan Garrido-Lecca",
   "homepage": "https://github.com/garridolecca/rustgis-databricks",
   "license": "Apache-2.0",
@@ -26,120 +26,139 @@
       "id": "connect",
       "label": "Connect",
       "icon": "database",
-      "help": "Pick a Databricks CLI profile and SQL warehouse. Sign-in uses the profile, like the Databricks CLI.",
-      "params": "{\"profile\": \"CLI profile in ~/.databrickscfg\", \"warehouse_id\": \"SQL warehouse id\"}",
-      "form": [
-        {
-          "name": "profile",
-          "label": "Databricks CLI profile",
-          "kind": "text",
-          "default": "DEFAULT",
-          "required": true
-        },
-        {
-          "name": "warehouse_id",
-          "label": "SQL warehouse ID",
-          "kind": "text",
-          "default": "",
-          "required": true
-        }
-      ],
+      "help": "Sign in with a Databricks CLI profile and pick a SQL warehouse (from the panel, or params).",
+      "params": "{\"profile\": \"CLI profile\", \"warehouse_id\": \"SQL warehouse id\"} (or the panel's form)",
       "timeout": 120
     },
     {
       "id": "browse",
       "label": "Browse\nSpatial Tables",
       "icon": "search",
-      "help": "List tables with a GEOMETRY or GEOGRAPHY column in a catalog (and optional schema).",
-      "params": "{\"catalog\": \"catalog\", \"schema\": \"optional schema\"}",
-      "form": [
-        {
-          "name": "catalog",
-          "label": "Catalog",
-          "kind": "text",
-          "default": "",
-          "required": true
-        },
-        {
-          "name": "schema",
-          "label": "Schema (optional)",
-          "kind": "text",
-          "default": ""
-        }
-      ],
-      "timeout": 120
+      "help": "List tables with GEOMETRY / GEOGRAPHY columns in a catalog (and optional schema).",
+      "params": "{\"catalog\": \"catalog\", \"schema\": \"optional schema\"} (or the panel's catalog)",
+      "timeout": 180
     },
     {
       "id": "add-table",
       "label": "Add\nTable",
       "icon": "add_layer",
-      "help": "Add a Unity Catalog table as a layer. Tick 'Only the current view' for big tables.",
-      "params": "{\"table\": \"catalog.schema.table\", \"geometry\": \"optional column\", \"limit\": 50000, \"in_view\": false}",
-      "form": [
-        {
-          "name": "table",
-          "label": "Table (catalog.schema.table)",
-          "kind": "text",
-          "default": "",
-          "required": true
-        },
-        {
-          "name": "geometry",
-          "label": "Geometry column (optional)",
-          "kind": "text",
-          "default": ""
-        },
-        {
-          "name": "limit",
-          "label": "Row limit",
-          "kind": "number",
-          "integer": true,
-          "default": 50000
-        },
-        {
-          "name": "in_view",
-          "label": "Only the current view",
-          "kind": "bool",
-          "default": false
-        }
-      ],
+      "help": "Add the selected (or named) Unity Catalog table as a layer.",
+      "params": "{\"table\": \"catalog.schema.table\", \"geometry\"?: \"column\", \"limit\"?: 50000, \"in_view\"?: false} (or the panel's selection)",
+      "timeout": 300
+    },
+    {
+      "id": "add-in-box",
+      "label": "Add Table\nin a Box",
+      "icon": "add_layer",
+      "help": "Add the selected table, only the rows inside a box drawn on the map.",
+      "params": "{\"table\": \"catalog.schema.table\", \"bbox\": [west, south, east, north]} (or the panel's pick)",
       "timeout": 300
     },
     {
       "id": "sql-layer",
       "label": "SQL\nLayer",
       "icon": "sql",
-      "help": "Run a SELECT on the warehouse and add the result as a layer. The first GEOMETRY / GEOGRAPHY column is the geometry.",
-      "params": "{\"sql\": \"SELECT ...\", \"name\": \"layer name\", \"geometry\": \"optional column\", \"limit\": 50000}",
-      "form": [
-        {
-          "name": "sql",
-          "label": "SELECT statement",
-          "kind": "text",
-          "default": "",
-          "required": true
-        },
-        {
-          "name": "name",
-          "label": "Layer name",
-          "kind": "text",
-          "default": "Databricks SQL"
-        },
-        {
-          "name": "geometry",
-          "label": "Geometry column (optional)",
-          "kind": "text",
-          "default": ""
-        },
-        {
-          "name": "limit",
-          "label": "Row limit",
-          "kind": "number",
-          "integer": true,
-          "default": 50000
-        }
-      ],
+      "help": "Run a SELECT on the warehouse and add the result as a layer.",
+      "params": "{\"sql\": \"SELECT ...\", \"name\"?: \"layer name\", \"geometry\"?: \"column\", \"limit\"?: 50000} (or the panel's SQL form)",
       "timeout": 300
+    },
+    {
+      "id": "select-table",
+      "label": "Select\nTable",
+      "icon": "info",
+      "help": "Show details of the table chosen in the panel.",
+      "params": "{}"
+    },
+    {
+      "id": "panel-state",
+      "label": "Refresh\nPanel",
+      "icon": "refresh",
+      "help": "Redraw the Databricks panel from the saved connection.",
+      "params": "{}"
     }
-  ]
+  ],
+  "panel": {
+    "title": "Databricks",
+    "icon": "database",
+    "help": "Browse Unity Catalog and add spatial tables or SQL from a Databricks SQL warehouse.",
+    "state": "panel-state",
+    "items": [
+      {
+        "kind": "text",
+        "id": "status",
+        "label": "Connection",
+        "text": "Not connected. Enter a Databricks CLI profile and a SQL warehouse ID, then Connect."
+      },
+      {
+        "kind": "form",
+        "id": "conn",
+        "label": "Sign in"
+      },
+      {
+        "kind": "button",
+        "command": "connect",
+        "label": "Connect"
+      },
+      {
+        "kind": "choice",
+        "id": "catalog",
+        "label": "Catalog",
+        "command": "browse",
+        "help": "Choose a catalog to list its spatial tables."
+      },
+      {
+        "kind": "tree",
+        "id": "tables",
+        "label": "Spatial tables (GEOMETRY / GEOGRAPHY)",
+        "search": true,
+        "command": "select-table"
+      },
+      {
+        "kind": "text",
+        "id": "selected",
+        "label": "Selected table",
+        "text": "Choose a table in the tree."
+      },
+      {
+        "kind": "form",
+        "id": "opts",
+        "label": "Options"
+      },
+      {
+        "kind": "checkbox",
+        "id": "in-view",
+        "label": "Only the current view",
+        "default": false,
+        "help": "Filter on the warehouse with ST_INTERSECTS against the map view."
+      },
+      {
+        "kind": "button",
+        "command": "add-table",
+        "label": "Add table"
+      },
+      {
+        "kind": "pick",
+        "id": "area",
+        "label": "Add table inside a box\u2026",
+        "shape": "box",
+        "command": "add-in-box"
+      },
+      {
+        "kind": "form",
+        "id": "sqlform",
+        "label": "SQL layer"
+      },
+      {
+        "kind": "button",
+        "command": "sql-layer",
+        "label": "Run SQL as a layer"
+      },
+      {
+        "kind": "text",
+        "id": "result",
+        "label": "Last result",
+        "text": "\u2014"
+      }
+    ]
+  }
 }

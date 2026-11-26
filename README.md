@@ -26,15 +26,36 @@ It is the RustGIS counterpart to the
 
 ## What you get
 
-| Command | What it does |
-|---|---|
-| **Connect** | Pick a Databricks CLI profile (`~/.databrickscfg`) and a SQL warehouse ID. The plugin tests the connection (current user, default catalog) and remembers it. |
-| **Browse Spatial Tables** | Lists every table in a catalog, or one of its schemas, that has a `GEOMETRY` or `GEOGRAPHY` column, read from `information_schema`. |
-| **Add Table** | Adds `catalog.schema.table` as a layer, with all its columns as attributes. Tick **Only the current view** to fetch just what's on screen, for tables too big to load whole. |
-| **SQL Layer** | Runs any `SELECT` (or `WITH … SELECT`) on the warehouse and adds the result as a layer: H3 aggregates, spatial joins, buffers, views. The first `GEOMETRY` / `GEOGRAPHY` column becomes the geometry. |
+### The Databricks panel
 
-All four commands appear on the RustGIS **Plugins** tab with their own dialogs. They also work from `rustgis-cli`,
-the RustGIS Python package and its MCP server, so scripts and AI agents can use them too.
+**Plugins → Databricks** opens a pane on the right of the map:
+
+| In the panel | What it does |
+|---|---|
+| **Connection** | The workspace and user you're signed in as. |
+| **Sign in** (CLI profile, SQL warehouse ID) + **Connect** | Signs in with a Databricks CLI profile (`~/.databrickscfg`) and loads the catalogs you can see. |
+| **Catalog** dropdown | Choosing a catalog lists its spatial tables. |
+| **Spatial tables** tree (searchable) | Every table with a `GEOMETRY` or `GEOGRAPHY` column, grouped by schema, with its geometry columns. Type to filter. |
+| **Options** (row limit, geometry column) and **Only the current view** | Control what **Add table** fetches. The view filter runs `ST_INTERSECTS` on the warehouse. |
+| **Add table** | Adds the selected table as a layer, with all its columns as attributes. |
+| **Add table inside a box…** | Drag a box on the map; only the rows inside it are fetched. Good for tables too big to load whole. |
+| **SQL layer** (SELECT, layer name) + **Run SQL as a layer** | Any `SELECT` (or `WITH … SELECT`) becomes a layer: H3 aggregates, spatial joins, buffers, views. |
+| **Last result** | How many features came back, and how long it took. |
+
+RustGIS keeps the panel's state, and the plugin remembers your connection, catalogs and table tree between sessions.
+
+### Commands
+
+The same actions are commands too, for the ribbon, `rustgis-cli`, the RustGIS Python package and its MCP server (so AI
+agents can use them). Explicit parameters win over the panel's values:
+
+| Command | Parameters |
+|---|---|
+| `plugin:databricks-sql/connect` | `{"profile": "…", "warehouse_id": "…"}` |
+| `plugin:databricks-sql/browse` | `{"catalog": "…", "schema"?: "…"}` |
+| `plugin:databricks-sql/add-table` | `{"table": "catalog.schema.table", "geometry"?: "…", "limit"?: 50000, "in_view"?: false}` |
+| `plugin:databricks-sql/add-in-box` | `{"table": "…", "bbox": [west, south, east, north]}` |
+| `plugin:databricks-sql/sql-layer` | `{"sql": "SELECT …", "name"?: "…", "geometry"?: "…", "limit"?: 50000}` |
 
 **Geometry handling:**
 - Geometry is returned as GeoJSON in WGS 84.
@@ -55,10 +76,10 @@ the RustGIS Python package and its MCP server, so scripts and AI agents can use 
 
 1. **Download:** get `databricks-sql-<version>.rgplugin` from [Releases](https://github.com/garridolecca/rustgis-databricks/releases).
 2. **Install:** in RustGIS, go to **Plugins → Plugin Manager → Settings → Install From File…** (or drop the file on the
-   Plugin Manager). On the command line: `rustgis-cli plugins install databricks-sql-0.1.0.rgplugin`.
+   Plugin Manager). On the command line: `rustgis-cli plugins install databricks-sql-0.2.0.rgplugin`.
 3. **Environment:** RustGIS builds the plugin's Python environment with uv: Python 3.12, `databricks-sql-connector`
    and `databricks-sdk`. This takes a minute, the first time only.
-4. **Connect:** run **Plugins → Databricks SQL → Connect** with your profile and warehouse ID.
+4. **Connect:** open **Plugins → Databricks**, enter your profile and warehouse ID, and click **Connect**.
 
 **Behind a PyPI mirror or a firewall?** RustGIS downloads uv from PyPI the first time. Point it at a uv that's
 already configured for your mirror instead, then click **Prepare** in the Plugin Manager:
@@ -97,15 +118,16 @@ Tested on Nov 25, 2026 with RustGIS 0.8.0 on macOS (arm64), against a Databricks
 
 | Test | Result |
 |---|---|
-| Connect (OAuth / profile sign-in) | ✓ |
-| Browse a schema | 8 spatial tables |
-| Add a point table | 14 features |
+| Connect | 216 catalogs listed |
+| Browse a catalog | 130 spatial tables in 28 schemas |
+| Add a point table | 14 features in 3.3 s |
 | H3 SQL layer | 646 hexagons |
 | Add a polygon table | 3 features |
 | **Only the current view**, around a neighbourhood | 197 of 1,207 points |
+| **Add table inside a box** | 66 points |
+| SQL buffers | 14 features |
 
-The whole sequence took about 11 seconds, including sign-in. Installing from the packaged `.rgplugin`, in a clean
-plugins folder, was tested too.
+Installing from the packaged `.rgplugin`, in a clean plugins folder, was tested too.
 
 ## How it works
 
@@ -115,15 +137,16 @@ plugins folder, was tested too.
   source's schema with `DESCRIBE QUERY`, selects the attributes plus `ST_ASGEOJSON(geometry)`, and hands RustGIS a
   GeoJSON FeatureCollection through `host.addLayer`.
 - **Settings:** the profile and warehouse are kept with `host.setSettings`.
-- **Files:** `plugin.json` (manifest), `main.py` (the plugin, about 200 lines), `requirements.txt`.
+- **The panel:** declared in `plugin.json`. Its forms, dropdown and tree are filled by the plugin's answers (`panel-state` when it opens, `connect`, `browse`).
+- **Files:** `plugin.json` (manifest and panel), `main.py` (the plugin, about 330 lines), `requirements.txt`.
 
 ## Limits and roadmap
 
 - Rows per layer are capped at 200,000 (default 50,000). Use **Only the current view**, or aggregate in SQL, for
   bigger tables.
-- **Only the current view** estimates the view's extent from the map's centre and scale.
-- **Planned:** live layers that refresh as you pan, Genie (natural-language) queries, and writing edits back to
-  Lakebase / PostGIS.
+- **Only the current view** estimates the view's extent from the map's centre and scale. For an exact area, use **Add table inside a box**.
+- **Planned:** live layers that refresh as you pan (a session plugin), Genie (natural-language) queries, and writing edits
+  back to Lakebase / PostGIS.
 
 ## Contributing
 
