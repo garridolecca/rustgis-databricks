@@ -1,7 +1,7 @@
 {
   "id": "databricks-sql",
   "name": "Databricks SQL",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A Databricks panel for RustGIS: browse Unity Catalog for GEOMETRY / GEOGRAPHY tables, load them with your own parameters or as dynamic layers that re-query the view as you pan and zoom, run SQL, and ask Genie in plain English (when your account has Genie). Signs in with a Databricks CLI profile.",
   "author": "Jhonatan Garrido-Lecca",
   "homepage": "https://github.com/garridolecca/rustgis-databricks",
@@ -197,16 +197,16 @@
         "kind": "tabs",
         "id": "mode",
         "command": "mode",
-        "default": "fixed",
-        "help": "How Add table loads the selected table.",
+        "default": "dynamic",
+        "help": "Follow the map (default): the layer refreshes itself as you pan and zoom. Load once: a one-time load.",
         "options": [
-          {
-            "id": "fixed",
-            "label": "My parameters"
-          },
           {
             "id": "dynamic",
             "label": "Follow the map"
+          },
+          {
+            "id": "fixed",
+            "label": "Load once"
           }
         ]
       },
@@ -214,7 +214,7 @@
         "kind": "text",
         "id": "modehelp",
         "label": "How it loads",
-        "text": "My parameters: Add table loads once, with your row limit, the current view or a box you draw."
+        "text": "Add table makes a dynamic layer: pan or zoom and it refreshes by itself, querying only what's in view."
       },
       {
         "kind": "form",
@@ -231,7 +231,7 @@
       {
         "kind": "button",
         "command": "add-table",
-        "label": "Add table"
+        "label": "Add to map"
       },
       {
         "kind": "pick",

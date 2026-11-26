@@ -20,7 +20,9 @@ Sign-in goes through the Databricks SDK and a Databricks CLI profile; the plugin
 """
 import datetime
 import decimal
+import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -31,9 +33,9 @@ import time
 import uuid
 
 MAX_ROWS = 200_000
-DEFAULT_LIMIT = 50_000
+DEFAULT_LIMIT = 10_000     # per view for dynamic layers: a screenful, fast to fetch
 PAD = 0.25                 # dynamic layers fetch 25% beyond the view, so small pans don't re-query
-DEBOUNCE_S = 0.8           # wait this long after the last view change before re-querying
+DEBOUNCE_S = 0.25          # re-query this long after the map stops moving
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "rustgis-databricks")
 
 # ---------------------------------------------------------------------------- session transport
@@ -43,21 +45,26 @@ _lock = threading.Lock()
 _seq = [0]
 
 
+_EOF = object()             # stdin closed: RustGIS is stopping us
+
+
 def _reader():
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         try:
-            _inbox.put(json.loads(line))
+            msg = json.loads(line)
         except ValueError:
             continue
-    _inbox.put(None)       # stdin closed: RustGIS is stopping us
+        if isinstance(msg, dict):
+            _inbox.put(msg)
+    _inbox.put(_EOF)
 
 
 def send(obj):
     with _lock:
-        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.write(json.dumps(obj, allow_nan=False) + "\n")
         sys.stdout.flush()
 
 
@@ -67,8 +74,14 @@ def call(op, params=None, timeout=120):
     send({"call": {"op": op, "params": params or {}}, "id": cid})
     end = time.time() + timeout
     while True:
-        msg = _inbox.get(timeout=max(1, end - time.time()))
-        if msg is None:
+        left = end - time.time()
+        if left <= 0:
+            raise TimeoutError(f"RustGIS didn't answer {op} in {timeout} s")
+        try:
+            msg = _inbox.get(timeout=left)
+        except queue.Empty:
+            raise TimeoutError(f"RustGIS didn't answer {op} in {timeout} s")
+        if msg is _EOF:
             raise SystemExit(0)
         if msg.get("id") == cid and ("ok" in msg or "error" in msg) and "command" not in msg:
             if "error" in msg:
@@ -81,7 +94,22 @@ def progress(text):
     send({"progress": text})
 
 
+_last_note = {"text": None, "at": 0.0}
+_warned = set()
+
+
+def warn_once(key, text):
+    """An error note shown once per layer and error, not on every pan."""
+    if key not in _warned:
+        _warned.add(key)
+        notify(text, error=True)
+
+
 def notify(text, error=False):
+    """A status-bar note (never a dialog). The same note within 30 s is dropped, so nothing nags."""
+    if text == _last_note["text"] and time.time() - _last_note["at"] < 30:
+        return
+    _last_note.update(text=text, at=time.time())
     try:
         call("host.notify", {"text": text, "error": error})
     except Exception:
@@ -113,20 +141,59 @@ def sdk_config(profile):
     return _cfg_cache[profile]
 
 
+CONN = {}                  # profile, warehouse_id: set on the main thread, read by the worker
+_tls = threading.local()
+
+
 def connect(profile, warehouse_id):
+    """A new connection (Connect's test). Long-lived ones come from get_conn()."""
     from databricks import sql
     cfg = sdk_config(profile)
     host = cfg.host.replace("https://", "").rstrip("/")
     conn = sql.connect(server_hostname=host, http_path=f"/sql/1.0/warehouses/{warehouse_id}",
-                       credentials_provider=lambda: cfg.authenticate, _user_agent_entry="rustgis-databricks-plugin/0.3")
+                       credentials_provider=lambda: cfg.authenticate, _user_agent_entry="rustgis-databricks-plugin/0.4")
     return conn, host
 
 
-def current():
-    s = settings()
-    if not s.get("profile") or not s.get("warehouse_id"):
+def get_conn(reset=False):
+    """This thread's warm connection to the current warehouse (opening a session costs ~1 s; reuse it)."""
+    key = (CONN.get("profile"), CONN.get("warehouse_id"))
+    if not all(key):
         raise RuntimeError("Not connected yet: in the Databricks panel, enter a CLI profile and a warehouse ID, then Connect.")
-    return connect(s["profile"], s["warehouse_id"])
+    c = getattr(_tls, "conn", None)
+    if c is not None and getattr(_tls, "key", None) == key and not reset:
+        return c, _tls.host
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+        _tls.conn = None
+    _tls.conn, _tls.host = connect(*key)
+    _tls.key = key
+    return _tls.conn, _tls.host
+
+
+class _Pooled:
+    """Looks like a connection, but close() keeps the warm session open."""
+    def __init__(self, c):
+        self._c = c
+
+    def cursor(self):
+        return self._c.cursor()
+
+    def close(self):
+        pass
+
+
+def current():
+    if not CONN.get("profile"):
+        s = settings()
+        if not s.get("profile") or not s.get("warehouse_id"):
+            raise RuntimeError("Not connected yet: in the Databricks panel, enter a CLI profile and a warehouse ID, then Connect.")
+        CONN.update(profile=s["profile"], warehouse_id=s["warehouse_id"])
+    c, host = get_conn()
+    return _Pooled(c), host
 
 
 def workspace(s=None):
@@ -155,13 +222,13 @@ def is_num(dtype):
 
 
 def map_extent():
-    return call("host.view") and (call("map.extent") or {}).get("extent")
+    return (call("map.extent") or {}).get("extent")
 
 
 def pad(b, f=PAD):
     w, s, e, n = b
     dx, dy = (e - w) * f, (n - s) * f
-    return [w - dx, max(s - dy, -89.9), e + dx, min(n + dy, 89.9)]
+    return [max(w - dx, -180.0), max(s - dy, -89.9), min(e + dx, 180.0), min(n + dy, 89.9)]
 
 
 def inside(inner, outer):
@@ -197,26 +264,73 @@ def geo_expr(cols, geom_col):
     return geom_col, e, flt
 
 
-def fetch(source_sql, geom_col, limit, bbox=None, wkb=False):
-    """Run the query (optionally inside a lon/lat box). Returns (FeatureCollection, truncated, host, cols);
-    with wkb=True the FeatureCollection's features carry WKB bytes in "wkb" instead of GeoJSON geometry."""
-    conn, host = current()
+SCHEMA = {}                # (source, geom) -> cached plan: columns, geometry expressions, point fast path
+
+
+def plan(cur, source_sql, geom_col):
+    key = (source_sql, geom_col)
+    if key in SCHEMA:
+        return SCHEMA[key]
+    cols = describe(cur, source_sql)
+    gcol, e, flt = geo_expr(cols, geom_col)
+    names = {c.lower(): c for c, t in cols if is_num(t)}
+    lon = next((names[k] for k in ("lon", "lng", "longitude") if k in names), None)
+    lat = next((names[k] for k in ("lat", "latitude") if k in names), None)
+    fast = None
+    if lon and lat:                       # point table with numeric lon/lat: plain range filters let Delta skip files
+        try:
+            cur.execute(f"SELECT ST_GEOMETRYTYPE({q(gcol)}) FROM {source_sql} AS src WHERE {q(gcol)} IS NOT NULL LIMIT 1")
+            r = cur.fetchone()
+            if r and str(r[0]).upper().endswith("POINT"):
+                fast = (lon, lat)
+        except Exception:
+            return (cols, gcol, e, flt, None)    # don't cache a failed probe
+    SCHEMA[key] = (cols, gcol, e, flt, fast)
+    return SCHEMA[key]
+
+
+def fetch(source_sql, geom_col, limit, bbox=None, wkb=False, holder=None, retry=True):
+    """Run the query (optionally inside a lon/lat box) on this thread's warm connection.
+    Returns (FeatureCollection, truncated, host, cols); with wkb=True features carry WKB in "wkb".
+    holder (a dict) gets the running cursor, so another thread can cancel a stale query."""
+    conn, host = get_conn()
+    cur = conn.cursor()
+    if holder is not None:
+        holder["cursor"] = cur
     try:
-        cur = conn.cursor()
-        cols = describe(cur, source_sql)
-        geom_col, e, flt = geo_expr(cols, geom_col)
+        cols, gcol, e, flt, fast = plan(cur, source_sql, geom_col)
         where = ""
         if bbox:
             w, s_, ea, n = (float(v) for v in bbox)
-            where = (f" WHERE ST_INTERSECTS({flt}, ST_GEOMFROMTEXT("
-                     f"'POLYGON(({w} {s_}, {ea} {s_}, {ea} {n}, {w} {n}, {w} {s_}))', 4326))")
-        others = ", ".join(q(c) for c, t in cols if c != geom_col and not is_geo(t))
+            if fast:
+                lo, la = (q(c) for c in fast)
+                where = f" WHERE {lo} BETWEEN {w} AND {ea} AND {la} BETWEEN {s_} AND {n}"
+            else:
+                where = (f" WHERE ST_INTERSECTS({flt}, ST_GEOMFROMTEXT("
+                         f"'POLYGON(({w} {s_}, {ea} {s_}, {ea} {n}, {w} {n}, {w} {s_}))', 4326))")
+        others = ", ".join(q(c) for c, t in cols if c != gcol and not is_geo(t))
         sel = (others + ", " if others else "") + (f"ST_ASWKB({e}) AS __geojson" if wkb else f"ST_ASGEOJSON({e}) AS __geojson")
         cur.execute(f"SELECT {sel} FROM {source_sql} AS src{where} LIMIT {int(limit)}")
-        rows = cur.fetchall()
-        names = [d[0] for d in cur.description]
+        try:
+            tbl = cur.fetchall_arrow()
+            names = tbl.column_names
+            data = tbl.to_pydict()
+            rows = list(zip(*[data[n] for n in names])) if names else []
+        except Exception:
+            rows = cur.fetchall()
+            names = [d[0] for d in cur.description]
+    except Exception as ex:
+        msg = str(ex).lower()
+        if retry and any(k in msg for k in ("session is closed", "invalid session", "session not found", "connection",
+                                             "token expired", "expired token", "unauthenticated", "401")):
+            get_conn(reset=True)           # stale session or token: reconnect once
+            return fetch(source_sql, geom_col, limit, bbox, wkb, holder, retry=False)
+        raise
     finally:
-        conn.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
     gi = names.index("__geojson")
     feats = []
     for r in rows:
@@ -227,9 +341,11 @@ def fetch(source_sql, geom_col, limit, bbox=None, wkb=False):
             if n == "__geojson":
                 continue
             if isinstance(val, decimal.Decimal):
-                val = float(val)                   # DECIMAL columns stay numeric, so they can drive styles
+                val = float(val)
             elif val is not None and not isinstance(val, (str, int, float, bool)):
                 val = str(val)
+            if isinstance(val, float) and not math.isfinite(val):
+                val = None                     # NaN / Infinity aren't JSON
             props[n] = val
         if wkb:
             feats.append({"wkb": bytes(r[gi]), "properties": props})
@@ -258,18 +374,26 @@ def _gpkg_type(v):
     return "INTEGER" if isinstance(v, bool) or isinstance(v, int) else "REAL" if isinstance(v, float) else "TEXT"
 
 
-def _write(path, fc, table="features"):
+RESERVED = {"fid", "geom"}
+
+
+def _write(path, fc, table="features", types_hint=None):
     """Write (or rewrite in place) a one-layer GeoPackage, so RustGIS reads it as a linked source it can reload.
     Stdlib sqlite3 only: GeoPackage geometry = 8-byte GP header (little-endian, no envelope, SRID 4326) + WKB."""
     import sqlite3
     import struct
     feats = fc["features"]
+    for f in feats:                             # 'fid' and 'geom' are the GeoPackage's own columns
+        for r in RESERVED & set(f["properties"]):
+            f["properties"][f"{r}_"] = f["properties"].pop(r)
     keys = []
     for f in feats:
         for k in f["properties"]:
             if k not in keys:
                 keys.append(k)
-    types = {k: next((_gpkg_type(f["properties"][k]) for f in feats if f["properties"].get(k) is not None), "TEXT") for k in keys}
+    hint = types_hint or {}
+    types = {k: hint.get(k) or next((_gpkg_type(f["properties"][k]) for f in feats if f["properties"].get(k) is not None), "TEXT")
+             for k in keys}
     new = not os.path.exists(path)
     con = sqlite3.connect(path, timeout=10)
     try:
@@ -301,7 +425,7 @@ def _write(path, fc, table="features"):
         head = b"GP" + bytes([0, 0x01]) + struct.pack("<i", 4326)
         # sqlite3 opens the transaction itself; commit() below makes the rewrite atomic
         cur.execute(f'DELETE FROM "{table}"')
-        names = ", ".join(['geom'] + [f'"{k}"' for k in keys])
+        names = ", ".join(['geom'] + [f'"{k}"' for k in keys])   # keys are already free of reserved names
         marks = ", ".join(["?"] * (len(keys) + 1))
         cur.executemany(f'INSERT INTO "{table}" ({names}) VALUES ({marks})',
                         [[head + f["wkb"]] + [f["properties"].get(k) for k in keys] for f in feats])
@@ -311,9 +435,77 @@ def _write(path, fc, table="features"):
         con.close()
 
 
+class LiveWorker:
+    """Runs dynamic-layer queries off the main thread. Latest view wins: a new job for a layer cancels the
+    running stale one, and results older than the layer's newest job are dropped."""
+    def __init__(self):
+        self.jobs = {}                # layer -> newest pending job
+        self.cv = threading.Condition()
+        self.running = None           # (layer, seq, holder)
+        self.results = queue.Queue()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def submit(self, name, seq, source, geom, limit, box):
+        stale = None
+        with self.cv:
+            self.jobs[name] = (seq, source, geom, limit, box)
+            r = self.running
+            if r and r[0] == name and r[1] < seq:
+                stale = r[2].get("cursor")
+            self.cv.notify()
+        if stale is not None:
+            try:
+                stale.cancel()                  # stop the stale query (outside the lock); the new view is what matters
+            except Exception:
+                pass
+
+    def _loop(self):
+        while True:
+            with self.cv:
+                while not self.jobs:
+                    self.cv.wait()
+                name, (seq, source, geom, limit, box) = self.jobs.popitem()
+                holder = {}
+                self.running = (name, seq, holder)
+            t0 = time.time()
+            try:
+                fc, trunc, _, _ = fetch(source, geom, limit, box, wkb=True, holder=holder)
+                self.results.put((name, seq, box, fc, trunc, time.time() - t0, None))
+            except Exception as e:
+                self.results.put((name, seq, box, None, False, time.time() - t0, e))
+            finally:
+                with self.cv:
+                    self.running = None
+
+
+WORKER = None
+_SEQ = itertools.count(1)   # global, so a re-added layer never accepts an old layer's in-flight result
+
+
+def worker():
+    global WORKER
+    if WORKER is None:
+        WORKER = LiveWorker()
+    return WORKER
+
+
+def gpkg_types(cols):
+    out = {}
+    for c, t in cols:
+        if is_geo(t):
+            continue
+        u = str(t).upper()
+        k = f"{c}_" if c in RESERVED else c
+        out[k] = ("INTEGER" if u.split("(")[0] in ("INT", "BIGINT", "SMALLINT", "TINYINT", "LONG", "BOOLEAN")
+                  else "REAL" if is_num(t) else "TEXT")
+    return out
+
+
 def start_live(table, geom, limit):
     os.makedirs(CACHE_DIR, exist_ok=True)
     name = table.split(".")[-1] + " (dynamic)"
+    if name in LIVE and LIVE[name]["source"] != quote_table(table):
+        name = ".".join(table.split(".")[-2:]) + " (dynamic)"     # same table name in another schema
     if name in LIVE:
         stop_live([name])
     ext = map_extent()
@@ -322,45 +514,79 @@ def start_live(table, geom, limit):
     box = pad(ext)
     t0 = time.time()
     progress("Querying the view…")
-    fc, trunc, host, _ = fetch(quote_table(table), geom, limit, box, wkb=True)
+    fc, trunc, host, cols = fetch(quote_table(table), geom, limit, box, wkb=True)
     path = os.path.join(CACHE_DIR, re.sub(r"[^\w\-]+", "_", table) + f"-{uuid.uuid4().hex[:6]}.gpkg")
-    _write(path, fc)
+    types = gpkg_types(cols)
+    _write(path, fc, types_hint=types)
     call("layer.addData", {"path": path, "name": name, "stream": True})      # linked (read in place), so it can be reloaded
-    LIVE[name] = {"source": quote_table(table), "geom": geom, "limit": limit, "path": path, "bbox": box, "truncated": trunc,
-                  "count": len(fc["features"]), "secs": time.time() - t0}
+    LIVE[name] = {"source": quote_table(table), "geom": geom, "limit": limit, "path": path, "bbox": box, "truncated": trunc, "types": types,
+                  "count": len(fc["features"]), "secs": time.time() - t0, "seq": next(_SEQ), "applied": 0}
+    LIVE[name]["applied"] = LIVE[name]["seq"]
+    worker()                                 # start the worker; its warm connection opens on its first refresh
     return name, len(fc["features"]), trunc, time.time() - t0
 
 
-def refresh_live(force=False):
+def schedule_refresh(force=False):
+    """Queue a query for each dynamic layer whose loaded area doesn't cover the view (or is truncated)."""
     if not LIVE:
-        return []
+        return 0
     ext = map_extent()
     if not ext:
-        return []
-    done = []
-    for name, L in list(LIVE.items()):
+        return 0
+    n = 0
+    for name, L in LIVE.items():
         if not force and inside(ext, L["bbox"]) and not L["truncated"]:
-            continue                               # the view is inside what's already loaded
-        box = pad(ext)
-        t0 = time.time()
+            continue                                   # the view is inside what's already loaded: nothing to fetch
+        L["seq"] = next(_SEQ)
+        worker().submit(name, L["seq"], L["source"], L["geom"], L["limit"], pad(ext))
+        n += 1
+    return n
+
+
+def apply_results():
+    """Draw finished queries (main thread). Stale ones are dropped."""
+    done = []
+    while True:
         try:
-            fc, trunc, _, _ = fetch(L["source"], L["geom"], L["limit"], box, wkb=True)
-        except Exception as e:
-            notify(f"{name}: {e}", error=True)
+            name, seq, box, fc, trunc, secs, err = worker().results.get_nowait() if WORKER else (None,) * 7
+        except queue.Empty:
+            break
+        if name is None:
+            break
+        L = LIVE.get(name)
+        if not L or seq < L["seq"]:
+            continue                                   # a newer view is on its way
+        if err is not None:
+            L["applied"] = seq
+            if "cancel" not in str(err).lower():
+                warn_once((name, str(err)[:80]), f"{name}: couldn't refresh ({str(err).splitlines()[0][:160]})")
             continue
-        _write(L["path"], fc)
+        _write(L["path"], fc, types_hint=L.get("types"))
         try:
             call("layer.reloadData", {"layer": name})
-        except Exception as e:                     # the layer was removed or renamed in RustGIS
+        except Exception as e:
             LIVE.pop(name, None)
             done.append(f"{name}: stopped ({e})")
             continue
-        L.update(bbox=box, truncated=trunc, count=len(fc["features"]), secs=time.time() - t0)
-        msg = f"{name}: {len(fc['features']):,} features in view ({time.time() - t0:.1f} s)"
+        was_trunc = L["truncated"]
+        L.update(bbox=box, truncated=trunc, count=len(fc["features"]), secs=secs, applied=seq)
+        msg = f"{name}: {len(fc['features']):,} in view, {secs:.1f} s"
         if trunc:
-            msg += f", the first {L['limit']:,} of more. Zoom in to see everything."
-        notify(msg)
+            msg += f" (first {L['limit']:,}; zoom in for all)"
+            if not was_trunc:
+                notify(f"{name}: showing the first {L['limit']:,} rows here. Zoom in to see everything.")
         done.append(msg)
+    return done
+
+
+def refresh_live(force=False, wait=20):
+    """Refresh now and wait for the result (the 'Refresh now' button and scripts)."""
+    if not schedule_refresh(force):
+        return []
+    end, done = time.time() + wait, []
+    while time.time() < end and any(L["applied"] < L["seq"] for L in LIVE.values()):
+        time.sleep(0.05)
+        done += apply_results()
     return done
 
 
@@ -459,9 +685,13 @@ def ask_genie(question, table, override_space=None, related=True):
                "then give two short, concrete recommendations.)" if table else question)
     progress("Genie is writing and running the SQL…")
     timeout = datetime.timedelta(minutes=5)
+    msg = None
     if conv.get("space") == space and conv.get("id"):
-        msg = w.genie.create_message_and_wait(space, conv["id"], content, timeout=timeout)
-    else:
+        try:
+            msg = w.genie.create_message_and_wait(space, conv["id"], content, timeout=timeout)
+        except Exception:
+            save_settings({"genie_conv": None})       # the conversation expired or was deleted: start fresh
+    if msg is None:
         msg = w.genie.start_conversation_and_wait(space, content, timeout=timeout)
         save_settings({"genie_conv": {"space": space, "id": msg.conversation_id}})
     text, sql, desc, follow = [], None, None, []
@@ -479,7 +709,7 @@ def ask_genie(question, table, override_space=None, related=True):
 
 def mappable(sql_text):
     """Wrap Genie's SQL so it has a GEOMETRY column: native geometry, WKT text, lon/lat, or an H3 cell."""
-    src = f"({sql_text.strip().rstrip(';')})"
+    src = f"({sql_text.strip().rstrip(';')}\n)"        # newline: a trailing -- comment can't swallow the ')' 
     conn, _ = current()
     try:
         cols = describe(conn.cursor(), src)
@@ -489,18 +719,27 @@ def mappable(sql_text):
     if any(is_geo(t) for _, t in cols):
         return src, None, cols
     for key in ("wkt", "geom_wkt", "geometry_wkt", "wkt_geom", "geom", "geometry", "shape"):
-        if key in names and not is_num(dict(cols)[names[key]]):
+        if key in names and str(dict(cols)[names[key]]).upper().startswith("STRING"):
             return f"(SELECT *, ST_SETSRID(ST_GEOMFROMWKT({q(names[key])}), 4326) AS __geom FROM {src})", "__geom", cols
-    lon = next((names[k] for k in ("lon", "lng", "longitude", "x") if k in names), None)
-    lat = next((names[k] for k in ("lat", "latitude", "y") if k in names), None)
+    lon = next((names[k] for k in ("lon", "lng", "longitude") if k in names), None)      # not x/y: often projected metres
+    lat = next((names[k] for k in ("lat", "latitude") if k in names), None)
     if lon and lat:
         return (f"(SELECT *, ST_SETSRID(ST_POINT(CAST({q(lon)} AS DOUBLE), CAST({q(lat)} AS DOUBLE)), 4326) AS __geom FROM {src})",
                 "__geom", cols)
-    h3 = next((c for c, t in cols if ("h3" in c.lower() or c.lower() in ("cell", "hex", "hex_id")) and
-               (is_num(t) or t.upper().startswith("STRING"))), None)
+    h3 = next((c for c, t in cols if re.fullmatch(r"(h3_?(cell|index|id)?|h3_\w*cell\w*|cell|hex|hex_id)", c.lower()) and
+               (str(t).upper().split("(")[0] in ("BIGINT", "LONG") or str(t).upper().startswith("STRING"))), None)
     if h3:
         return f"(SELECT *, ST_SETSRID(ST_GEOMFROMWKT(h3_boundaryaswkt({q(h3)})), 4326) AS __geom FROM {src})", "__geom", cols
     return None, None, cols
+
+
+def zoom_to(name):
+    """Put a layer on top and zoom the map to it."""
+    for op, params in (("layer.move", {"layer": name, "to": 0}), ("layer.zoomTo", {"layer": name})):
+        try:
+            call(op, params)
+        except Exception:
+            pass
 
 
 def style_by_measure(name, cols):
@@ -523,9 +762,9 @@ SECTIONS = {"tables": ["status", "conn", "connect", "catalog", "tables", "select
             "genie": ["status", "selected", "genieform", "ask-genie", "genie-new", "genie-answer", "followups"]}
 ALL_ITEMS = sorted({i for v in SECTIONS.values() for i in v})
 MODE_HELP = {
-    "fixed": "My parameters: Add table loads once, with your row limit, the current view or a box you draw.",
-    "dynamic": "Follow the map: Add table makes a dynamic layer. Each pan or zoom re-queries the warehouse with the "
-               "view's box (ST_INTERSECTS), up to the row limit, so you never pull more than you see.",
+    "dynamic": "Add table makes a dynamic layer: pan or zoom and it refreshes by itself, querying only what's in view "
+               "(up to the row limit), so you never pull more than you see.",
+    "fixed": "Load once: Add table loads the table one time, whole or only the current view, or draw a box to load just that area.",
 }
 
 
@@ -548,7 +787,7 @@ def visibility(section, mode, s=None):
             vis[i]["visible"] = not dyn
         for i in ("refresh-live", "stop-live"):
             vis[i]["visible"] = dyn
-        vis["add-table"]["label"] = "Add dynamic layer" if dyn else "Add table"
+        vis["add-table"]["label"] = "Add to map" if dyn else "Load once"
     return vis
 
 
@@ -567,7 +806,8 @@ def form_fields(s):
                   "help": "A profile in ~/.databrickscfg, signed in with `databricks auth login`."},
                  {"id": "warehouse_id", "kind": "text", "label": "SQL warehouse ID", "default": s.get("warehouse_id", ""), "required": True,
                   "help": "From the warehouse's Connection details (the last part of its HTTP path)."}],
-        "opts": [{"id": "limit", "kind": "number", "integer": True, "label": "Row limit", "default": s.get("limit", DEFAULT_LIMIT)},
+        "opts": [{"id": "limit", "kind": "number", "integer": True, "label": "Row limit (per view)", "default": s.get("limit", DEFAULT_LIMIT),
+                  "help": "Dynamic layers fetch at most this many rows for the view; zoom in for more detail."},
                  {"id": "geometry", "kind": "text", "label": "Geometry column", "default": "",
                   "help": "Leave empty to use the table's first GEOMETRY / GEOGRAPHY column."}],
         "sqlform": [{"id": "sql", "kind": "text", "label": "SELECT", "default": "",
@@ -598,11 +838,17 @@ def tree_nodes(rows):
             for sch, tables in sorted(by_schema.items())]
 
 
+QUIET = [True]             # set per command: panel clicks (no params) get no pop-up report, just the panel text
+
+
 def answer(report, items=None, values=None):
     panel = {"items": merge({"result": {"text": report}}, items or {})}
     if values:
         panel["values"] = values
-    return {"report": report, "panel": panel}
+    out = {"panel": panel}
+    if not QUIET[0]:
+        out["report"] = report      # scripts / rustgis-cli / agents still get a one-line result
+    return out
 
 
 def pick(params, panel, key, form=None, field=None):
@@ -642,7 +888,7 @@ def browse_report(cat, nodes, sch=""):
 def cmd_panel_state(p, pv):
     s = settings()
     f = form_fields(s)
-    section, mode = pv.get("section") or "tables", pv.get("mode") or "fixed"
+    section, mode = pv.get("section") or "tables", pv.get("mode") or "dynamic"
     items = merge(visibility(section, mode, s),
                   {"status": {"text": status_text(s)}, "conn": {"fields": f["conn"]}, "opts": {"fields": f["opts"]},
                    "sqlform": {"fields": f["sqlform"]}, "genieform": {"fields": f["genieform"]},
@@ -669,11 +915,11 @@ def cmd_panel_state(p, pv):
 
 
 def cmd_section(p, pv):
-    return {"panel": {"items": visibility(p.get("section") or pv.get("section") or "tables", pv.get("mode") or "fixed", settings())}}
+    return {"panel": {"items": visibility(p.get("section") or pv.get("section") or "tables", pv.get("mode") or "dynamic", settings())}}
 
 
 def cmd_mode(p, pv):
-    mode = p.get("mode") or pv.get("mode") or "fixed"
+    mode = p.get("mode") or pv.get("mode") or "dynamic"
     items = merge(visibility(pv.get("section") or "tables", mode, settings()),
                   {"modehelp": {"text": MODE_HELP[mode] + ("\n" + live_text() if mode == "dynamic" else "")}})
     return {"panel": {"items": items}}
@@ -693,6 +939,8 @@ def cmd_connect(p, pv):
         catalogs = sorted(r[0] for r in cur.fetchall() if r[0] not in ("system", "__databricks_internal", "samples"))[:1000]
     finally:
         conn.close()
+    CONN.update(profile=profile, warehouse_id=wh)
+    SCHEMA.clear()
     default_cat = cat if cat in catalogs else (catalogs[0] if catalogs else None)
     save_settings({"profile": profile, "warehouse_id": wh, "host": host, "user": user, "catalogs": catalogs,
                    "catalog": default_cat, "tree": None})
@@ -708,7 +956,7 @@ def cmd_connect(p, pv):
         values["catalog"] = default_cat
     items = {"status": {"text": status_text(s)}, "catalog": {"options": [{"id": c, "label": c} for c in catalogs]},
              "tables": {"nodes": nodes}, "selected": {"text": "Choose a table in the tree."}}
-    items = merge({k: v for k, v in visibility(pv.get("section") or "tables", pv.get("mode") or "fixed", s).items() if k in GENIE_ITEMS}, items)
+    items = merge({k: v for k, v in visibility(pv.get("section") or "tables", pv.get("mode") or "dynamic", s).items() if k in GENIE_ITEMS}, items)
     return answer(report, items, values)
 
 
@@ -752,7 +1000,7 @@ def _geom(p, pv):
 
 def cmd_add_table(p, pv):
     t = _table(p, pv)
-    mode = p.get("mode") or pv.get("mode") or "fixed"
+    mode = p.get("mode") or pv.get("mode") or "dynamic"
     if mode == "dynamic" or p.get("dynamic"):
         name, n, trunc, secs = start_live(t, _geom(p, pv), _limit(p, pv))
         msg = (f"Dynamic layer '{name}': {n:,} features in view ({secs:.1f} s). It refreshes as you pan and zoom"
@@ -760,7 +1008,10 @@ def cmd_add_table(p, pv):
         return answer(msg, {"modehelp": {"text": MODE_HELP["dynamic"] + "\n" + live_text()}})
     in_view = p["in_view"] if "in_view" in p else bool(pv.get("in-view"))
     bbox = map_extent() if in_view else None
-    report, _ = load(quote_table(t), _geom(p, pv), t.split(".")[-1] + (" (view)" if in_view else ""), _limit(p, pv), bbox)
+    name = t.split(".")[-1] + (" (view)" if in_view else "")
+    report, _ = load(quote_table(t), _geom(p, pv), name, _limit(p, pv), bbox)
+    if not in_view:
+        zoom_to(name)
     return answer(report)
 
 
@@ -812,6 +1063,7 @@ def _genie(question, table, space_override, pv):
             name = "Genie: " + (question[:40] + ("…" if len(question) > 40 else ""))
             report, cols2 = load(src, gcol, name, _limit({}, pv))
             measure = style_by_measure(name, cols2)
+            zoom_to(name)
             layer_note = report + (f" Styled by {measure}." if measure else "")
         else:
             layer_note = "Genie's result has no geometry, WKT, lon/lat or H3 cell to map; see the answer above."
@@ -870,6 +1122,7 @@ def run_command(msg):
         if not fn:
             send({"error": f"unknown command '{req.get('id')}'", "id": msg.get("id")})
             return
+        QUIET[0] = not (req.get("params") or {})
         send({"ok": fn(req.get("params") or {}, pv), "id": msg.get("id")})
     except SystemExit:
         raise
@@ -885,10 +1138,10 @@ def main():
         msg = _pending.pop(0) if _pending else None
         if msg is None:
             try:
-                msg = _inbox.get(timeout=0.2)
+                msg = _inbox.get(timeout=0.05)
             except queue.Empty:
                 msg = "tick"
-            if msg is None:
+            if msg is _EOF:
                 return                                  # stdin closed: exit with RustGIS
         if isinstance(msg, dict) and "command" in msg:
             run_command(msg)
@@ -901,14 +1154,16 @@ def main():
                     LIVE.pop(n, None)
             except Exception:
                 pass
-        if view_changed_at and LIVE and time.time() - view_changed_at >= DEBOUNCE_S:
-            view_changed_at = None
-            try:
-                refresh_live()
-            except SystemExit:
-                raise
-            except Exception as e:
-                notify(f"Dynamic refresh failed: {e}", error=True)
+        try:
+            if view_changed_at and LIVE and time.time() - view_changed_at >= DEBOUNCE_S:
+                view_changed_at = None
+                schedule_refresh()
+            if WORKER is not None:
+                apply_results()
+        except SystemExit:
+            raise
+        except Exception as e:
+            notify(f"Dynamic refresh failed: {e}", error=True)
 
 
 if __name__ == "__main__":

@@ -43,11 +43,11 @@ It is the RustGIS counterpart to the
 | **Sign in** (CLI profile, SQL warehouse ID) + **Connect** | Signs in with a Databricks CLI profile (`~/.databrickscfg`) and loads the catalogs you can see. |
 | **Catalog** dropdown | Choosing a catalog lists its spatial tables. |
 | **Spatial tables** tree (searchable) | Every table with a `GEOMETRY` or `GEOGRAPHY` column, grouped by schema, with its geometry columns. Type to filter. |
-| **My parameters / Follow the map** tabs | How **Add table** loads the selected table (below). |
-| **Options** (row limit, geometry column) | Applies in both modes. |
-| **Add table** | *My parameters:* adds the table once, whole or **only the current view**. *Follow the map:* adds a **dynamic layer**. |
-| **Add table inside a box…** | *My parameters:* drag a box on the map; only the rows inside it are fetched. |
-| **Refresh now** / **Stop dynamic layers** | *Follow the map:* re-query now, or stop following; the layers stay on the map. |
+| **Follow the map** (default) / **Load once** tabs | How **Add to map** loads the selected table. |
+| **Add to map** | *Follow the map:* a **dynamic layer** that refreshes itself as you pan and zoom. *Load once:* the whole table, or **only the current view**. |
+| **Options** (row limit per view, geometry column) | Applies in both modes. The default limit is 10,000 rows per view. |
+| **Add table inside a box…** | *Load once:* drag a box on the map; only the rows inside it are fetched. |
+| **Refresh now** / **Stop dynamic layers** | *Follow the map:* refresh straight away, or stop following; the layers stay on the map. |
 | **Last result** | How many features came back, and how long it took. |
 
 **SQL:** type any `SELECT` (or `WITH … SELECT`) and click **Run SQL as a layer**: H3 aggregates, spatial joins, buffers, views.
@@ -56,16 +56,28 @@ It is the RustGIS counterpart to the
 
 ### Dynamic layers: query only what you see
 
-In **Follow the map** mode, **Add table** makes a layer whose rows follow the map:
-- **Queries:** after each pan or zoom (once you stop moving), the plugin re-queries the warehouse with the view's box
-  inside the query, `WHERE ST_INTERSECTS(geom, <view box>)`, up to the row limit. You never pull more than you see.
+**Follow the map** is the default: **Add to map** makes a layer whose rows follow the map, with no button to press.
+- **Queries:** about 0.25 s after you stop panning or zooming, the plugin re-queries the warehouse with the view's box
+  inside the query, up to the row limit. You never pull more than you see.
+- **Speed:**
+  - The plugin keeps one **warm connection** per session and caches each table's columns, so a refresh is a single query.
+  - Queries run on a **background worker**. A new view cancels a stale query, and only the latest view is drawn.
+  - **Point tables with lon/lat columns** filter on plain coordinate ranges, which lets Delta skip files.
+    Other tables use `ST_INTERSECTS(geom, <view box>)`.
+  - Results stream as **Arrow**.
 - **Padding:** it fetches 25% beyond the view, so small pans inside what's loaded don't query at all.
 - **Row limit:** past the limit you see the first N rows and a "zoom in to see everything" note.
 - **Styling:** rows land in a small local GeoPackage that RustGIS reads in place and reloads, so styling and labels
   survive every refresh.
 
-Tested: one customer table went from 238 rows (a neighbourhood) to 367 (the Westside) to 1,207 (all of Los Angeles),
-each refresh in 1.6–3.3 s.
+Tested: refreshes take **0.3–0.8 s** on a customer table, from 238 to 1,207 rows (it was 1.6–3.3 s in v0.3).
+On a dense road network of 127k line segments, refreshes take 0.7–1.7 s at the 10,000-row cap.
+
+**Quiet by design:**
+- Panel clicks don't pop up dialogs; results appear in the panel's **Last result** line.
+- Routine refreshes are silent.
+- A status-bar note appears only when a layer starts hitting the row limit ("zoom in to see everything"), or once per
+  layer for a real error.
 
 ### Ask Genie
 
@@ -83,8 +95,8 @@ On the **Genie** tab, ask a question about the selected table in plain English:
    - use `ST_DISTANCESPHERE` for distances in metres;
    - start with an insight and end with two recommendations.
 2. **Genie writes, runs and checks the SQL**, then answers.
-3. **The plugin maps the result.** It uses native geometry, or builds one from WKT, lon/lat or an H3 cell id, and
-   styles the layer by its main numeric measure.
+3. **The plugin maps the result.** It uses native geometry, or builds one from WKT, lon/lat or an H3 cell id. It styles
+   the layer by its main numeric measure, puts it on top and **zooms the map to it**.
 4. **The panel shows Genie's answer, its SQL and follow-up ideas.** Choose a follow-up to ask it in the same
    conversation; **New conversation** starts fresh.
 
@@ -130,7 +142,7 @@ agents can use them). Explicit parameters win over the panel's values:
 
 1. **Download:** get `databricks-sql-<version>.rgplugin` from [Releases](https://github.com/garridolecca/rustgis-databricks/releases).
 2. **Install:** in RustGIS, go to **Plugins → Plugin Manager → Settings → Install From File…** (or drop the file on the
-   Plugin Manager). On the command line: `rustgis-cli plugins install databricks-sql-0.3.0.rgplugin`.
+   Plugin Manager). On the command line: `rustgis-cli plugins install databricks-sql-0.4.0.rgplugin`.
 3. **Environment:** RustGIS builds the plugin's Python environment with uv: Python 3.12, `databricks-sql-connector`
    and `databricks-sdk`. This takes a minute, the first time only.
 4. **Connect:** open **Plugins → Databricks**, enter your profile and warehouse ID, and click **Connect**.
@@ -180,7 +192,9 @@ Tested on Nov 25, 2026 with RustGIS 0.8.0 on macOS (arm64), against a Databricks
 | **Only the current view**, around a neighbourhood | 197 of 1,207 points |
 | **Add table inside a box** | 66 points |
 | SQL buffers | 14 features |
-| Dynamic layer: neighbourhood, then Westside, then all of LA | 238, then 367, then 1,207 rows; refreshes 1.6–3.3 s |
+| Dynamic layer: neighbourhood, then Westside, then all of LA | 238, then 367, then 1,207 rows; refreshes 0.3–0.8 s |
+| Dynamic layer on 127k road segments | 10,000-row cap; refreshes 0.7–1.7 s |
+| Genie answer while the map shows another city | layer added, styled, and the map zooms to it |
 | Genie: customer value per H3 cell | 646 cells mapped and styled, 24 s (space created) |
 | Genie: loyalty customers within 3 km of each store | 14 stores (11–118 customers), joined with `ST_DISTANCESPHERE`, 39 s |
 | No-Genie account | Genie controls greyed out, with an explanation |
