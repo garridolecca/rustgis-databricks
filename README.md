@@ -1,9 +1,14 @@
 # Databricks SQL for RustGIS
 
 **Map your Databricks lakehouse in [RustGIS](https://rustgis.app), with no exports.** This plugin connects the fast,
-open-source RustGIS desktop to a **Databricks SQL warehouse**. You can browse Unity Catalog for spatial tables, add
-them as layers, or turn any `SELECT` into a layer, with `GEOMETRY` / `GEOGRAPHY` columns, H3 and Databricks
-spatial SQL running on the warehouse.
+open-source RustGIS desktop to a **Databricks SQL warehouse**:
+- **Browse:** Unity Catalog for spatial tables.
+- **Load:** tables with your own parameters, or as **dynamic layers** that re-query only what's in view as you pan and zoom.
+- **Query:** turn any `SELECT` into a layer.
+- **Ask Genie:** plain-English questions, when your account has [Genie](https://docs.databricks.com/genie/). Genie writes
+  and runs the SQL; the plugin maps the result and shows Genie's insight, recommendations and follow-up ideas.
+
+`GEOMETRY` / `GEOGRAPHY`, H3 and Databricks spatial SQL all run on the warehouse.
 
 ![RustGIS showing 646 H3 cells of customer density and 14 store locations in Los Angeles, queried live from Databricks](docs/rustgis-la-h3.png)
 *Los Angeles, queried live from a Databricks SQL warehouse: customers aggregated to H3 resolution-8 cells (one SQL
@@ -28,7 +33,9 @@ It is the RustGIS counterpart to the
 
 ### The Databricks panel
 
-**Plugins → Databricks** opens a pane on the right of the map:
+**Plugins → Databricks** opens a pane on the right of the map, with three tabs: **Tables · SQL · Genie**.
+
+**Tables**
 
 | In the panel | What it does |
 |---|---|
@@ -36,11 +43,55 @@ It is the RustGIS counterpart to the
 | **Sign in** (CLI profile, SQL warehouse ID) + **Connect** | Signs in with a Databricks CLI profile (`~/.databrickscfg`) and loads the catalogs you can see. |
 | **Catalog** dropdown | Choosing a catalog lists its spatial tables. |
 | **Spatial tables** tree (searchable) | Every table with a `GEOMETRY` or `GEOGRAPHY` column, grouped by schema, with its geometry columns. Type to filter. |
-| **Options** (row limit, geometry column) and **Only the current view** | Control what **Add table** fetches. The view filter runs `ST_INTERSECTS` on the warehouse. |
-| **Add table** | Adds the selected table as a layer, with all its columns as attributes. |
-| **Add table inside a box…** | Drag a box on the map; only the rows inside it are fetched. Good for tables too big to load whole. |
-| **SQL layer** (SELECT, layer name) + **Run SQL as a layer** | Any `SELECT` (or `WITH … SELECT`) becomes a layer: H3 aggregates, spatial joins, buffers, views. |
+| **My parameters / Follow the map** tabs | How **Add table** loads the selected table (below). |
+| **Options** (row limit, geometry column) | Applies in both modes. |
+| **Add table** | *My parameters:* adds the table once, whole or **only the current view**. *Follow the map:* adds a **dynamic layer**. |
+| **Add table inside a box…** | *My parameters:* drag a box on the map; only the rows inside it are fetched. |
+| **Refresh now** / **Stop dynamic layers** | *Follow the map:* re-query now, or stop following; the layers stay on the map. |
 | **Last result** | How many features came back, and how long it took. |
+
+**SQL:** type any `SELECT` (or `WITH … SELECT`) and click **Run SQL as a layer**: H3 aggregates, spatial joins, buffers, views.
+
+**Genie:** see [Ask Genie](#ask-genie).
+
+### Dynamic layers: query only what you see
+
+In **Follow the map** mode, **Add table** makes a layer whose rows follow the map:
+- **Queries:** after each pan or zoom (once you stop moving), the plugin re-queries the warehouse with the view's box
+  inside the query, `WHERE ST_INTERSECTS(geom, <view box>)`, up to the row limit. You never pull more than you see.
+- **Padding:** it fetches 25% beyond the view, so small pans inside what's loaded don't query at all.
+- **Row limit:** past the limit you see the first N rows and a "zoom in to see everything" note.
+- **Styling:** rows land in a small local GeoPackage that RustGIS reads in place and reloads, so styling and labels
+  survive every refresh.
+
+Tested: one customer table went from 238 rows (a neighbourhood) to 367 (the Westside) to 1,207 (all of Los Angeles),
+each refresh in 1.6–3.3 s.
+
+### Ask Genie
+
+![Genie's answer as a map: customer lifetime value per H3 cell in Los Angeles](docs/rustgis-genie-h3.png)
+*"Where are our highest-value loyalty customers concentrated? Aggregate to H3 cells." Genie wrote and ran the SQL; the
+plugin mapped 646 H3 cells styled by total lifetime value.*
+
+On the **Genie** tab, ask a question about the selected table in plain English:
+
+1. **Genie learns your table.** On your first question about a table, the plugin creates a Genie space for it,
+   *RustGIS · \<table\>*, and reuses it after that. The space includes up to 9 other spatial tables in the same
+   schema for joins, unless you turn that off. Its instructions are tuned for maps:
+   - always return a geometry (or WKT, lon/lat or an H3 cell);
+   - aggregate large results to H3;
+   - use `ST_DISTANCESPHERE` for distances in metres;
+   - start with an insight and end with two recommendations.
+2. **Genie writes, runs and checks the SQL**, then answers.
+3. **The plugin maps the result.** It uses native geometry, or builds one from WKT, lon/lat or an H3 cell id, and
+   styles the layer by its main numeric measure.
+4. **The panel shows Genie's answer, its SQL and follow-up ideas.** Choose a follow-up to ask it in the same
+   conversation; **New conversation** starts fresh.
+
+You can also paste the ID of a curated Genie space you already have.
+
+**No Genie? No problem.** When you connect, the plugin checks whether your account can use Genie. If it can't, the
+Genie controls are greyed out, with a tooltip and a note saying Genie is needed, and everything else works as usual.
 
 RustGIS keeps the panel's state, and the plugin remembers your connection, catalogs and table tree between sessions.
 
@@ -53,7 +104,10 @@ agents can use them). Explicit parameters win over the panel's values:
 |---|---|
 | `plugin:databricks-sql/connect` | `{"profile": "…", "warehouse_id": "…"}` |
 | `plugin:databricks-sql/browse` | `{"catalog": "…", "schema"?: "…"}` |
-| `plugin:databricks-sql/add-table` | `{"table": "catalog.schema.table", "geometry"?: "…", "limit"?: 50000, "in_view"?: false}` |
+| `plugin:databricks-sql/add-table` | `{"table": "catalog.schema.table", "mode"?: "fixed"\|"dynamic", "geometry"?: "…", "limit"?: 50000, "in_view"?: false}` |
+| `plugin:databricks-sql/refresh-live`, `stop-live` | `{}` |
+| `plugin:databricks-sql/ask-genie` | `{"question": "…", "table"?: "catalog.schema.table", "space"?: "Genie space ID"}` |
+| `plugin:databricks-sql/genie-follow`, `genie-new` | `{"followup": "f0"}`, `{}` |
 | `plugin:databricks-sql/add-in-box` | `{"table": "…", "bbox": [west, south, east, north]}` |
 | `plugin:databricks-sql/sql-layer` | `{"sql": "SELECT …", "name"?: "…", "geometry"?: "…", "limit"?: 50000}` |
 
@@ -76,7 +130,7 @@ agents can use them). Explicit parameters win over the panel's values:
 
 1. **Download:** get `databricks-sql-<version>.rgplugin` from [Releases](https://github.com/garridolecca/rustgis-databricks/releases).
 2. **Install:** in RustGIS, go to **Plugins → Plugin Manager → Settings → Install From File…** (or drop the file on the
-   Plugin Manager). On the command line: `rustgis-cli plugins install databricks-sql-0.2.0.rgplugin`.
+   Plugin Manager). On the command line: `rustgis-cli plugins install databricks-sql-0.3.0.rgplugin`.
 3. **Environment:** RustGIS builds the plugin's Python environment with uv: Python 3.12, `databricks-sql-connector`
    and `databricks-sdk`. This takes a minute, the first time only.
 4. **Connect:** open **Plugins → Databricks**, enter your profile and warehouse ID, and click **Connect**.
@@ -118,7 +172,7 @@ Tested on Nov 25, 2026 with RustGIS 0.8.0 on macOS (arm64), against a Databricks
 
 | Test | Result |
 |---|---|
-| Connect | 216 catalogs listed |
+| Connect (and Genie check) | 216 catalogs; Genie available |
 | Browse a catalog | 130 spatial tables in 28 schemas |
 | Add a point table | 14 features in 3.3 s |
 | H3 SQL layer | 646 hexagons |
@@ -126,13 +180,17 @@ Tested on Nov 25, 2026 with RustGIS 0.8.0 on macOS (arm64), against a Databricks
 | **Only the current view**, around a neighbourhood | 197 of 1,207 points |
 | **Add table inside a box** | 66 points |
 | SQL buffers | 14 features |
+| Dynamic layer: neighbourhood, then Westside, then all of LA | 238, then 367, then 1,207 rows; refreshes 1.6–3.3 s |
+| Genie: customer value per H3 cell | 646 cells mapped and styled, 24 s (space created) |
+| Genie: loyalty customers within 3 km of each store | 14 stores (11–118 customers), joined with `ST_DISTANCESPHERE`, 39 s |
+| No-Genie account | Genie controls greyed out, with an explanation |
 
 Installing from the packaged `.rgplugin`, in a clean plugins folder, was tested too.
 
 ## How it works
 
-- **Plugin model:** a RustGIS [process plugin](https://github.com/opengeos/RustGIS/blob/main/docs/plugins.md#process-plugins).
-  RustGIS starts `main.py` for each command and talks to it over standard input and output with JSON lines (ABI 1).
+- **Plugin model:** a RustGIS [session process plugin](https://github.com/opengeos/RustGIS/blob/main/docs/plugins.md#process-plugins).
+  RustGIS keeps `main.py` running and talks to it over standard input and output with JSON lines (ABI 1). Commands, host requests and map `view` events share the one connection.
 - **Running a command:** the plugin opens a `databricks-sql-connector` session with the SDK's credentials. It reads the
   source's schema with `DESCRIBE QUERY`, selects the attributes plus `ST_ASGEOJSON(geometry)`, and hands RustGIS a
   GeoJSON FeatureCollection through `host.addLayer`.
@@ -145,8 +203,8 @@ Installing from the packaged `.rgplugin`, in a clean plugins folder, was tested 
 - Rows per layer are capped at 200,000 (default 50,000). Use **Only the current view**, or aggregate in SQL, for
   bigger tables.
 - **Only the current view** estimates the view's extent from the map's centre and scale. For an exact area, use **Add table inside a box**.
-- **Planned:** live layers that refresh as you pan (a session plugin), Genie (natural-language) queries, and writing edits
-  back to Lakebase / PostGIS.
+- **Genie:** it needs a SQL warehouse your account can use, plus permission to create Genie spaces, or a space ID you paste.
+- **Planned:** writing edits back to Lakebase / PostGIS, and Genie charts beside the map.
 
 ## Contributing
 

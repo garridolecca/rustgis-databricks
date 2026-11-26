@@ -1,8 +1,8 @@
 {
   "id": "databricks-sql",
   "name": "Databricks SQL",
-  "version": "0.2.0",
-  "description": "A Databricks panel for RustGIS: sign in with a Databricks CLI profile, browse Unity Catalog for GEOMETRY / GEOGRAPHY tables, and add them, or any SQL, as layers. Filter to the current view or a box you draw, so big tables stay on the warehouse.",
+  "version": "0.3.0",
+  "description": "A Databricks panel for RustGIS: browse Unity Catalog for GEOMETRY / GEOGRAPHY tables, load them with your own parameters or as dynamic layers that re-query the view as you pan and zoom, run SQL, and ask Genie in plain English (when your account has Genie). Signs in with a Databricks CLI profile.",
   "author": "Jhonatan Garrido-Lecca",
   "homepage": "https://github.com/garridolecca/rustgis-databricks",
   "license": "Apache-2.0",
@@ -19,31 +19,32 @@
   ],
   "permissions": [
     "edit",
-    "network"
+    "network",
+    "files"
   ],
   "commands": [
     {
       "id": "connect",
       "label": "Connect",
       "icon": "database",
-      "help": "Sign in with a Databricks CLI profile and pick a SQL warehouse (from the panel, or params).",
+      "help": "Sign in with a Databricks CLI profile and a SQL warehouse.",
       "params": "{\"profile\": \"CLI profile\", \"warehouse_id\": \"SQL warehouse id\"} (or the panel's form)",
-      "timeout": 120
+      "timeout": 180
     },
     {
       "id": "browse",
       "label": "Browse\nSpatial Tables",
       "icon": "search",
-      "help": "List tables with GEOMETRY / GEOGRAPHY columns in a catalog (and optional schema).",
-      "params": "{\"catalog\": \"catalog\", \"schema\": \"optional schema\"} (or the panel's catalog)",
+      "help": "List tables with GEOMETRY / GEOGRAPHY columns in a catalog.",
+      "params": "{\"catalog\": \"catalog\", \"schema\"?: \"schema\"} (or the panel's catalog)",
       "timeout": 180
     },
     {
       "id": "add-table",
       "label": "Add\nTable",
       "icon": "add_layer",
-      "help": "Add the selected (or named) Unity Catalog table as a layer.",
-      "params": "{\"table\": \"catalog.schema.table\", \"geometry\"?: \"column\", \"limit\"?: 50000, \"in_view\"?: false} (or the panel's selection)",
+      "help": "Add the selected table: once with your parameters, or as a dynamic layer that follows the map.",
+      "params": "{\"table\": \"catalog.schema.table\", \"mode\"?: \"fixed\"|\"dynamic\", \"geometry\"?: \"column\", \"limit\"?: 50000, \"in_view\"?: false}",
       "timeout": 300
     },
     {
@@ -55,12 +56,50 @@
       "timeout": 300
     },
     {
+      "id": "refresh-live",
+      "label": "Refresh\nDynamic",
+      "icon": "refresh",
+      "help": "Re-query every dynamic layer for the current view now.",
+      "params": "{}",
+      "timeout": 300
+    },
+    {
+      "id": "stop-live",
+      "label": "Stop\nDynamic",
+      "icon": "close",
+      "help": "Stop refreshing dynamic layers (they stay on the map as they are).",
+      "params": "{}"
+    },
+    {
       "id": "sql-layer",
       "label": "SQL\nLayer",
       "icon": "sql",
       "help": "Run a SELECT on the warehouse and add the result as a layer.",
       "params": "{\"sql\": \"SELECT ...\", \"name\"?: \"layer name\", \"geometry\"?: \"column\", \"limit\"?: 50000} (or the panel's SQL form)",
       "timeout": 300
+    },
+    {
+      "id": "ask-genie",
+      "label": "Ask\nGenie",
+      "icon": "assistant",
+      "help": "Ask Genie about the selected table in plain English; the result is mapped. Needs Genie (AI/BI) in your Databricks workspace. Greyed out when your account doesn't have it.",
+      "params": "{\"question\": \"\u2026\", \"table\"?: \"catalog.schema.table\", \"space\"?: \"Genie space id\"} (or the panel)",
+      "timeout": 360
+    },
+    {
+      "id": "genie-follow",
+      "label": "Genie\nFollow-up",
+      "icon": "assistant",
+      "help": "Ask the follow-up chosen in the panel. Needs Genie (AI/BI) in your Databricks workspace. Greyed out when your account doesn't have it.",
+      "params": "{\"followup\": \"f0\"}",
+      "timeout": 360
+    },
+    {
+      "id": "genie-new",
+      "label": "New Genie\nConversation",
+      "icon": "assistant",
+      "help": "Start a fresh Genie conversation. Needs Genie (AI/BI) in your Databricks workspace. Greyed out when your account doesn't have it.",
+      "params": "{}"
     },
     {
       "id": "select-table",
@@ -70,19 +109,54 @@
       "params": "{}"
     },
     {
+      "id": "section",
+      "label": "Panel\nSection",
+      "icon": "info",
+      "help": "Switch the panel between Tables, SQL and Genie.",
+      "params": "{\"section\": \"tables\"|\"sql\"|\"genie\"}"
+    },
+    {
+      "id": "mode",
+      "label": "Load\nMode",
+      "icon": "info",
+      "help": "Switch between your own parameters and a dynamic layer.",
+      "params": "{\"mode\": \"fixed\"|\"dynamic\"}"
+    },
+    {
       "id": "panel-state",
       "label": "Refresh\nPanel",
       "icon": "refresh",
-      "help": "Redraw the Databricks panel from the saved connection.",
-      "params": "{}"
+      "help": "Redraw the Databricks panel.",
+      "params": "{}",
+      "timeout": 180
     }
   ],
   "panel": {
     "title": "Databricks",
     "icon": "database",
-    "help": "Browse Unity Catalog and add spatial tables or SQL from a Databricks SQL warehouse.",
+    "help": "Browse Unity Catalog, load spatial tables (fixed or dynamic), run SQL and ask Genie.",
     "state": "panel-state",
     "items": [
+      {
+        "kind": "tabs",
+        "id": "section",
+        "command": "section",
+        "default": "tables",
+        "options": [
+          {
+            "id": "tables",
+            "label": "Tables"
+          },
+          {
+            "id": "sql",
+            "label": "SQL"
+          },
+          {
+            "id": "genie",
+            "label": "Genie"
+          }
+        ]
+      },
       {
         "kind": "text",
         "id": "status",
@@ -120,6 +194,29 @@
         "text": "Choose a table in the tree."
       },
       {
+        "kind": "tabs",
+        "id": "mode",
+        "command": "mode",
+        "default": "fixed",
+        "help": "How Add table loads the selected table.",
+        "options": [
+          {
+            "id": "fixed",
+            "label": "My parameters"
+          },
+          {
+            "id": "dynamic",
+            "label": "Follow the map"
+          }
+        ]
+      },
+      {
+        "kind": "text",
+        "id": "modehelp",
+        "label": "How it loads",
+        "text": "My parameters: Add table loads once, with your row limit, the current view or a box you draw."
+      },
+      {
         "kind": "form",
         "id": "opts",
         "label": "Options"
@@ -144,6 +241,16 @@
         "command": "add-in-box"
       },
       {
+        "kind": "button",
+        "command": "refresh-live",
+        "label": "Refresh now"
+      },
+      {
+        "kind": "button",
+        "command": "stop-live",
+        "label": "Stop dynamic layers"
+      },
+      {
         "kind": "form",
         "id": "sqlform",
         "label": "SQL layer"
@@ -154,11 +261,43 @@
         "label": "Run SQL as a layer"
       },
       {
+        "kind": "form",
+        "id": "genieform",
+        "label": "Genie",
+        "help": "Needs Genie (AI/BI) in your Databricks workspace. Greyed out when your account doesn't have it."
+      },
+      {
+        "kind": "button",
+        "command": "ask-genie",
+        "label": "Ask Genie",
+        "help": "Needs Genie (AI/BI) in your Databricks workspace. Greyed out when your account doesn't have it."
+      },
+      {
+        "kind": "button",
+        "command": "genie-new",
+        "label": "New conversation",
+        "help": "Needs Genie (AI/BI) in your Databricks workspace. Greyed out when your account doesn't have it."
+      },
+      {
+        "kind": "text",
+        "id": "genie-answer",
+        "label": "Genie's answer",
+        "text": "\u2014"
+      },
+      {
+        "kind": "choice",
+        "id": "followups",
+        "label": "Follow-up ideas",
+        "command": "genie-follow",
+        "help": "Choose one to ask it. Needs Genie (AI/BI) in your Databricks workspace. Greyed out when your account doesn't have it."
+      },
+      {
         "kind": "text",
         "id": "result",
         "label": "Last result",
         "text": "\u2014"
       }
     ]
-  }
+  },
+  "session": true
 }

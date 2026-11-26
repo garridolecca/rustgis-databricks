@@ -1,0 +1,11 @@
+{
+  "id": "databricks-sql",
+  "source": {
+    "url": "https://github.com/garridolecca/rustgis-databricks/releases/download/v0.3.0/databricks-sql-0.3.0.rgplugin",
+    "sha256": "944eb05e88b356489c741704daf1d1d54040f7637bc4efebe7c526df0be538cd"
+  },
+  "categories": [
+    "Data",
+    "Vector"
+  ]
+}
